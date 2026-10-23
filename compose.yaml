@@ -1,0 +1,20 @@
+name: lore-studio
+services:
+  db:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_USER: lore
+      POSTGRES_PASSWORD: lore_local
+      POSTGRES_DB: lore_studio
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - lore_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lore -d lore_studio"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  lore_data:
