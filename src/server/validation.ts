@@ -24,6 +24,7 @@ const eventObject = z.object({
 }).strict();
 const relationObject = z.object({
   fromId: idSchema, toId: idSchema, kind: z.string().trim().min(1).max(100),
+  familyKind: z.enum(["other", "parent", "adoptive_parent", "spouse"]).default("other"),
   mutual: z.boolean().default(true), startYear: optionalYear, endYear: optionalYear, description: text,
 }).strict();
 export const characterSchema = characterObject.refine(

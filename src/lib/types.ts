@@ -14,5 +14,6 @@ export type LoreEvent = {
 export type Relation = {
   id: string; worldId: string; fromId: string; toId: string; kind: string; mutual: boolean;
   startYear: number | null; endYear: number | null; description: string; version: number;
+  familyKind?: import("./history-types").FamilyKind;
 };
-export type WorldData = { world: World; characters: Character[]; events: LoreEvent[]; relations: Relation[] };
+export type WorldData = { world: World; characters: Character[]; events: LoreEvent[]; relations: Relation[]; history?: import("./history-types").HistoryContext };

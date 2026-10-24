@@ -6,6 +6,8 @@ import { createSession, dummyPasswordWork, getUser, hashPassword, limitLogin, re
 import { characterPatch, characterSchema, credentialsSchema, eventPatch, eventSchema, idSchema, projectPatch, projectSchema, registrationSchema, relationPatch, relationSchema, worldSchema } from "@/server/validation";
 import { audit, createEntity, createProject, createWorld, loadWorld, mutateEntity, projectAccess, worldAccess } from "@/server/repository";
 import { createDemo } from "@/server/demo";
+import { compareTimelines, createCalendar, createTimeline, listCalendars, listTimelines, objectHistory, transferObjects, updateTimeline } from "@/server/history";
+import { calendarCreateSchema, daySchema, temporalOptions, timelineCreateSchema, timelinePatchSchema, transferSchema } from "@/server/history-validation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,9 +52,10 @@ async function dispatch(request: NextRequest, path: string[]) {
   const method = request.method;
   const key = path.join("/");
   if (key === "health" && method === "GET") {
-    const result = await pool.query("SELECT name FROM schema_migrations WHERE name='001_initial.sql'");
-    if (!result.rowCount) throw new ApiError(503, "Необходимо применить миграции");
-    return json({ status: "ok", database: "connected" });
+    const result = await pool.query("SELECT name FROM schema_migrations WHERE name=ANY($1::text[])", [["001_initial.sql", "002_history.sql"]]);
+    if (result.rowCount !== 2) throw new ApiError(503, "Необходимо применить миграции");
+    const database = await pool.query<{test_database:boolean}>("SELECT current_database() ~ '_test$' AS test_database");
+    return json({ status: "ok", database: "connected", testDatabase: database.rows[0].test_database });
   }
   if (key === "session" && method === "GET") return json({ user: await getUser(request) });
   if (key === "auth/register" && method === "POST") {
@@ -83,6 +86,29 @@ async function dispatch(request: NextRequest, path: string[]) {
     return json({ ok: true }, 200, sessionCookie("", true));
   }
   const user = await requireUser(request);
+  if (method !== "GET" && request.nextUrl.searchParams.has("revision")) throw new ApiError(400, "Нельзя изменять зафиксированную редакцию");
+  if (path[0] === "timelines" && path.length >= 2) {
+    const id = uuid(path[1]);
+    if (path.length === 2 && method === "PATCH") {
+      const input = await body(request, timelinePatchSchema);
+      return json({ timeline: await transaction((client) => updateTimeline(client,user.id,id,input)) });
+    }
+    if (path.length === 3 && path[2] === "compare" && method === "GET") {
+      const other = request.nextUrl.searchParams.get("other");
+      if (!other) throw new ApiError(400,"Выберите линию для сравнения");
+      const otherId = uuid(other);
+      const day = request.nextUrl.searchParams.has("day") ? daySchema.parse(request.nextUrl.searchParams.get("day")) : undefined;
+      return json(await transaction((client) => compareTimelines(client,user.id,id,otherId,day)));
+    }
+    if (path.length === 3 && path[2] === "transfer" && method === "POST") {
+      const input = await body(request, transferSchema);
+      return json(await transaction((client) => transferObjects(client,user.id,id,input)));
+    }
+  }
+  if (path.length === 3 && path[2] === "history" && method === "GET" && (path[0] === "characters" || path[0] === "events" || path[0] === "relations")) {
+    const kind = path[0], id = uuid(path[1]);
+    return json({ revisions: await transaction((client) => objectHistory(client,user.id,kind,id,temporalOptions(request.nextUrl.searchParams))) });
+  }
   if (key === "projects") {
     if (method === "GET") {
       const result = await pool.query(`SELECT p.id,p.name,p.description,p.created_at AS "createdAt",m.role FROM projects p
@@ -131,7 +157,21 @@ async function dispatch(request: NextRequest, path: string[]) {
   }
   if (path[0] === "worlds" && path.length >= 2) {
     const id = uuid(path[1]);
-    if (path.length === 2 && method === "GET") return json(await transaction((client) => loadWorld(client, user.id, id)));
+    if (path.length === 3 && path[2] === "timelines") {
+      if (method === "GET") return json({ timelines: await transaction((client)=>listTimelines(client,user.id,id)) });
+      if (method === "POST") {
+        const input = await body(request,timelineCreateSchema);
+        return json({ timeline: await transaction((client)=>createTimeline(client,user.id,id,input)) },201);
+      }
+    }
+    if (path.length === 3 && path[2] === "calendars") {
+      if (method === "GET") return json({ calendars: await transaction((client)=>listCalendars(client,user.id,id)) });
+      if (method === "POST") {
+        const input = await body(request,calendarCreateSchema);
+        return json({ calendar: await transaction((client)=>createCalendar(client,user.id,id,input.definition)) },201);
+      }
+    }
+    if (path.length === 2 && method === "GET") return json(await transaction((client) => loadWorld(client, user.id, id, temporalOptions(request.nextUrl.searchParams))));
     if (path.length === 2 && method === "PATCH") {
       const input = await body(request, projectPatch);
       if (!Object.keys(input).length) throw new ApiError(400, "Нет изменений для сохранения");
@@ -153,18 +193,18 @@ async function dispatch(request: NextRequest, path: string[]) {
       if (entity === "characters" || entity === "events" || entity === "relations") {
         const schema = entity === "characters" ? characterSchema : entity === "events" ? eventSchema : relationSchema;
         const input = await body(request, schema as ZodType);
-        const value = await transaction((client) => createEntity(client, user.id, id, entity, input));
+        const value = await transaction((client) => createEntity(client, user.id, id, entity, input, temporalOptions(request.nextUrl.searchParams,true)));
         return json({ [entity === "characters" ? "character" : entity === "events" ? "event" : "relation"]: value }, 201);
       }
     }
   }
   if (path.length === 2 && (path[0] === "characters" || path[0] === "events" || path[0] === "relations")) {
     const table = path[0], id = uuid(path[1]);
-    if (method === "DELETE") return json(await transaction((client) => mutateEntity(client, user.id, table, id, null)));
+    if (method === "DELETE") return json(await transaction((client) => mutateEntity(client, user.id, table, id, null, temporalOptions(request.nextUrl.searchParams,true))));
     if (method === "PATCH") {
       const schema = table === "characters" ? characterPatch : table === "events" ? eventPatch : relationPatch;
       const input = await body(request, schema);
-      const value = await transaction((client) => mutateEntity(client, user.id, table, id, input));
+      const value = await transaction((client) => mutateEntity(client, user.id, table, id, input, temporalOptions(request.nextUrl.searchParams,true)));
       return json({ [table === "characters" ? "character" : table === "events" ? "event" : "relation"]: value });
     }
   }
