@@ -75,7 +75,7 @@ async function biography(page: Page, name: string, expected: string, replacement
   } else await dialog.getByRole("button", { name: "Закрыть редактор", exact: true }).click();
 }
 
-test("историческая дата, независимая ветка и семейное древо сохраняются после перезагрузки", async ({ page }) => {
+test("исторические ветки и общее семейное древо сохраняются после перезагрузки", async ({ page }) => {
   test.setTimeout(120000);
   const { project, world, main } = await setup(page);
   const parentName = "Эльвар Основатель", firstName = "Лиора Наследница", siblingName = "Мира Наследница";
@@ -121,22 +121,26 @@ test("историческая дата, независимая ветка и с
       const relationDialog = page.getByRole("dialog");
       await relationDialog.getByRole("combobox", { name: "От персонажа", exact: true }).selectOption({ label: parentName });
       await relationDialog.getByRole("combobox", { name: "К персонажу", exact: true }).selectOption({ label: name });
-      await relationDialog.getByRole("combobox", { name: "Тип отношения", exact: true }).fill("Родитель");
       await relationDialog.getByRole("combobox", { name: "Семейная связь", exact: true }).selectOption("parent");
-      await relationDialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+      await relationDialog.getByRole("button", { name: "Сохранить родство", exact: true }).click();
       await expect(relationDialog).toHaveCount(0);
     }
     const firstFamily = page.getByRole("article").filter({ has: page.getByRole("heading", { name: firstName, exact: true }) });
     await expect(firstFamily.getByText(parentName, { exact: true })).toBeVisible();
     await expect(firstFamily.getByText(siblingName, { exact: true })).toBeVisible();
     await page.reload();
+    await section(page, "Обзор мира");
     await line(page, childId);
     await showYear(page, 1000);
     await section(page, "Семейное древо");
     await expect(firstFamily.getByText(siblingName, { exact: true })).toBeVisible();
+    await section(page, "Обзор мира");
     await line(page, main.id);
-    await expect(firstFamily.getByText(siblingName, { exact: true })).toHaveCount(0);
+    await section(page, "Семейное древо");
+    // The approved 0.3 family model belongs to the world, independently of its lines.
+    await expect(firstFamily.getByText(siblingName, { exact: true })).toBeVisible();
 
+    await section(page, "Обзор мира");
     await page.getByRole("button", { name: "Сравнить временные линии", exact: true }).click();
     const comparison = page.getByRole("dialog", { name: "Сравнение и перенос объектов", exact: true });
     await comparison.getByRole("combobox", { name: "Сравнить с линией", exact: true }).selectOption(childId);

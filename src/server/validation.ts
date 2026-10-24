@@ -23,7 +23,9 @@ const eventObject = z.object({
   endYear: optionalYear, description: text, characterIds: z.array(idSchema).max(500).default([]), status,
 }).strict();
 const relationObject = z.object({
-  fromId: idSchema, toId: idSchema, kind: z.string().trim().min(1).max(100),
+  fromId: idSchema.optional(), toId: idSchema.optional(),
+  participantIds: z.array(idSchema).min(2, "Выберите не менее двух персонажей").max(10, "В отношении может быть не более 10 участников").optional(),
+  kind: z.string().trim().min(1).max(100),
   familyKind: z.enum(["other", "parent", "adoptive_parent", "spouse"]).default("other"),
   mutual: z.boolean().default(true), startYear: optionalYear, endYear: optionalYear, description: text,
 }).strict();
@@ -35,9 +37,24 @@ export const eventSchema = eventObject.refine(
   (v) => v.endYear === null || v.endYear >= v.startYear,
   { message: "Окончание не может предшествовать началу", path: ["endYear"] },
 ).refine((v) => new Set(v.characterIds).size === v.characterIds.length, { message: "Участники не должны повторяться", path: ["characterIds"] });
-export const relationSchema = relationObject.refine((v) => v.fromId !== v.toId, { message: "Выберите двух разных персонажей", path: ["toId"] })
-  .refine((v) => v.startYear === null || v.endYear === null || v.endYear >= v.startYear,
-    { message: "Окончание не может предшествовать началу", path: ["endYear"] });
+/** Legacy pairs are normalized without changing immutable stored payloads. */
+export function relationParticipants(value: { participantIds?: unknown; fromId?: unknown; toId?: unknown }): string[] {
+  if (Array.isArray(value.participantIds)) return value.participantIds.filter((id): id is string => typeof id === "string");
+  return [value.fromId, value.toId].filter((id): id is string => typeof id === "string");
+}
+export const relationSchema = relationObject.superRefine((v, context) => {
+  const ids = relationParticipants(v);
+  if (ids.length < 2 || ids.length > 10) context.addIssue({ code: "custom", path: ["participantIds"], message: "Выберите от 2 до 10 персонажей" });
+  if (new Set(ids).size !== ids.length) context.addIssue({ code: "custom", path: ["participantIds"], message: "Участники отношения не должны повторяться" });
+  if (v.participantIds && ((v.fromId !== undefined && v.fromId !== ids[0]) || (v.toId !== undefined && v.toId !== ids[1]))) {
+    context.addIssue({ code: "custom", path: ["participantIds"], message: "Начальные участники не соответствуют указанной паре" });
+  }
+  if (v.familyKind !== "other" && ids.length !== 2) context.addIssue({ code: "custom", path: ["familyKind"], message: "Родственная связь задаётся для пары персонажей" });
+  if (v.startYear !== null && v.endYear !== null && v.endYear < v.startYear) context.addIssue({ code: "custom", path: ["endYear"], message: "Окончание не может предшествовать началу" });
+}).transform((v) => {
+  const participantIds = relationParticipants(v);
+  return { ...v, fromId: participantIds[0], toId: participantIds[1], participantIds };
+});
 const version = z.number().int().positive();
 // Remove create defaults before making fields optional: omitted PATCH fields must stay unchanged.
 function patch<T extends z.ZodRawShape>(shape: T) {

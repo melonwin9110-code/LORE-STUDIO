@@ -5,8 +5,9 @@ import { GREGORIAN, gregorianYearDay, toOrdinal, validateCalendar, type Calendar
 import { assertFamilyConsistent } from "@/lib/family";
 import { audit, worldAccess } from "./access";
 import { ApiError } from "./errors";
-import { characterSchema, eventSchema, relationSchema } from "./validation";
+import { characterSchema, eventSchema, relationParticipants, relationSchema } from "./validation";
 import { BASELINE_DAY, LATEST_DAY, type TemporalOptions } from "./history-validation";
+import { withPortraits } from "./portraits";
 
 type Kind = "characters" | "events" | "relations";
 type Fact = Record<string, unknown>;
@@ -26,6 +27,7 @@ const lineage = `WITH RECURSIVE lineage AS (
 
 export async function initializeWorld(client: PoolClient, worldId: string) {
   await client.query("INSERT INTO timelines(world_id,name,is_main,is_canon) VALUES($1,'Основная история',true,true) ON CONFLICT(world_id) WHERE is_main DO NOTHING", [worldId]);
+  await client.query("INSERT INTO world_family_state(world_id,initialized) VALUES($1,true) ON CONFLICT(world_id) DO NOTHING", [worldId]);
   await client.query("INSERT INTO world_calendars(world_id,definition,is_default) VALUES($1,$2::jsonb,true) ON CONFLICT(world_id) WHERE is_default DO NOTHING", [worldId, JSON.stringify(GREGORIAN)]);
 }
 async function context(client: PoolClient, userId: string, worldId: string, options: TemporalOptions = {}, write = false): Promise<Context> {
@@ -51,14 +53,16 @@ async function resolve(client: PoolClient, timeline: Timeline, day = LATEST_DAY,
   return found.rows;
 }
 function entity(row: StateRow): Character | LoreEvent | Relation {
-  return { ...row.data, id: row.object_id, worldId: row.world_id, version: row.version } as Character | LoreEvent | Relation;
+  const value = { ...row.data, id: row.object_id, worldId: row.world_id, version: row.version };
+  if (row.kind === "relations") return { ...value, participantIds: relationParticipants(row.data ?? {}) } as Relation;
+  return value as Character | LoreEvent | Relation;
 }
 function publicData(rows: StateRow[], day?: string) {
   const live = rows.filter((row) => !row.deleted);
   const characters = live.filter((row) => row.kind === "characters").map((row) => entity(row) as Character).sort((a,b) => a.name.localeCompare(b.name,"ru"));
   const ids = new Set(characters.map((value) => value.id));
   const events = live.filter((row) => row.kind === "events").map((row) => entity(row) as LoreEvent).map((event) => ({ ...event, characterIds: event.characterIds.filter((id) => ids.has(id)) })).sort((a,b) => a.startYear-b.startYear || a.name.localeCompare(b.name,"ru"));
-  const relations = live.filter((row) => row.kind === "relations").map((row) => entity(row) as Relation).filter((relation) => ids.has(relation.fromId) && ids.has(relation.toId) && (day === undefined || active(relation,day)));
+  const relations = live.filter((row) => row.kind === "relations").map((row) => entity(row) as Relation).filter((relation) => relationParticipants(relation).every((id) => ids.has(id)) && (day === undefined || active(relation,day)));
   return { characters, events, relations };
 }
 function active(relation: Relation, day: string) {
@@ -83,7 +87,9 @@ export async function loadWorld(client: PoolClient, userId: string, worldId: str
   const rows = await resolve(client,timeline,options.day,options.revision);
   const timelines = await listTimelines(client,userId,worldId);
   const calendars = await listCalendars(client,userId,worldId);
-  return { world, ...publicData(rows,options.day), history: { timeline,timelines,calendars,day:options.day ?? null } };
+  const data = publicData(rows,options.day);
+  data.characters = await withPortraits(client, data.characters);
+  return { world, ...data, history: { timeline,timelines,calendars,day:options.day ?? null } };
 }
 function parse(kind: Kind, value: unknown): Fact {
   const parsed = (kind === "characters" ? characterSchema.parse(value) : kind === "events" ? eventSchema.parse(value) : relationSchema.parse(value)) as Fact;
@@ -110,7 +116,7 @@ async function append(client: PoolClient, scoped: Context, userId: string, objec
   return row;
 }
 async function ensureLinks(client: PoolClient, scoped: Context, day: string, kind: Kind, value: Fact) {
-  const ids = kind === "events" ? value.characterIds as string[] : kind === "relations" ? [value.fromId,value.toId] as string[] : [];
+  const ids = kind === "events" ? value.characterIds as string[] : kind === "relations" ? relationParticipants(value) : [];
   if (!ids.length) return;
   const rows = await resolve(client,scoped.timeline,day);
   const available = new Set(rows.filter((row)=>row.kind==="characters"&&!row.deleted).map((row)=>row.object_id));
@@ -140,7 +146,7 @@ async function assertConsistent(client: PoolClient, scoped: Context, from: strin
     const ids = new Set(characters.map((character)=>character.id));
     const relations = live.filter((row)=>row.kind==="relations").map((row)=>entity(row) as Relation);
     for (const row of live) {
-      const linked = row.kind==="events" ? row.data!.characterIds as string[] : row.kind==="relations" ? [row.data!.fromId,row.data!.toId] as string[] : [];
+      const linked = row.kind==="events" ? row.data!.characterIds as string[] : row.kind==="relations" ? relationParticipants(row.data!) : [];
       if (linked.some((id)=>!ids.has(id))) throw new ApiError(400,"Правка оставляет ссылку на отсутствующего персонажа в историческом состоянии");
     }
     try { assertFamilyConsistent(characters,relations.filter((relation)=>active(relation,day))); }
@@ -173,7 +179,11 @@ export async function mutateEntity(client:PoolClient,userId:string,kind:Kind,id:
         const rows=await resolve(client,scoped.timeline,point);
         for(const row of rows.filter((value)=>!value.deleted)) {
           if(row.object_id===id) await append(client,scoped,userId,id,kind,point,null,row);
-          else if(row.kind==="relations"&&(row.data!.fromId===id||row.data!.toId===id)) await append(client,scoped,userId,row.object_id,"relations",point,null,row);
+          else if(row.kind==="relations"&&relationParticipants(row.data!).includes(id)) {
+            const participantIds = relationParticipants(row.data!).filter((participant) => participant !== id);
+            const value = participantIds.length < 2 ? null : parse("relations", { ...row.data, participantIds, fromId: participantIds[0], toId: participantIds[1] });
+            await append(client,scoped,userId,row.object_id,"relations",point,value,row);
+          }
           else if(row.kind==="events"&&(row.data!.characterIds as string[]).includes(id)) await append(client,scoped,userId,row.object_id,"events",point,{...row.data,characterIds:(row.data!.characterIds as string[]).filter((value)=>value!==id)},row);
         }
       }
@@ -184,7 +194,20 @@ export async function mutateEntity(client:PoolClient,userId:string,kind:Kind,id:
   const {version,...changes}=patch;
   if(!Object.keys(changes).length) throw new ApiError(400,"Нет изменений для сохранения");
   if(version!==before.version) throw new ApiError(409,"Объект изменён в другом окне. Обновите данные и повторите правку");
-  const value=parse(kind,{...before.data,...changes});
+  const combined = {...before.data,...changes};
+  if (kind === "relations") {
+    if (Object.hasOwn(changes,"participantIds")) {
+      const participants = relationParticipants(changes);
+      if (!Object.hasOwn(changes,"fromId")) combined.fromId = participants[0];
+      if (!Object.hasOwn(changes,"toId")) combined.toId = participants[1];
+    } else if (Object.hasOwn(changes,"fromId") || Object.hasOwn(changes,"toId")) {
+      const participants = relationParticipants(before.data!);
+      if (Object.hasOwn(changes,"fromId")) participants[0] = changes.fromId as string;
+      if (Object.hasOwn(changes,"toId")) participants[1] = changes.toId as string;
+      combined.participantIds = participants;
+    }
+  }
+  const value=parse(kind,combined);
   await ensureLinks(client,scoped,day,kind,value);
   const saved=await append(client,scoped,userId,id,kind,day,value,before);
   await assertConsistent(client,scoped,day);
@@ -215,6 +238,10 @@ export async function createCalendar(client:PoolClient,userId:string,worldId:str
   await audit(client,world.projectId,userId,"calendar",result.rows[0].id,"create",{after:result.rows[0]});
   return result.rows[0];
 }
+function semantic(row: StateRow): Fact | null {
+  if (!row.data) return null;
+  return row.kind === "relations" ? { ...row.data, participantIds: relationParticipants(row.data) } : row.data;
+}
 function canonical(value:unknown):string {
   if(Array.isArray(value))return `[${value.map(canonical).join(",")}]`;
   if(value!==null&&typeof value==="object")return `{${Object.entries(value).sort(([a],[b])=>a.localeCompare(b)).map(([key,item])=>`${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
@@ -229,7 +256,7 @@ export async function compareTimelines(client:PoolClient,userId:string,leftId:st
   const differences:Difference[]=[];
   for(const id of new Set([...a.keys(),...b.keys()])) {
     const first=a.get(id),second=b.get(id);
-    if(first&&second&&canonical(first.data)===canonical(second.data))continue;
+    if(first&&second&&canonical(semantic(first))===canonical(semantic(second)))continue;
     differences.push({id,kind:(first??second)!.kind,change:!second?"added":!first?"removed":"changed",left:first?entity(first) as unknown as Fact:null,right:second?entity(second) as unknown as Fact:null});
   }
   return {differences,leftRevision:left.timeline.headRevision,rightRevision:right.timeline.headRevision};
@@ -251,19 +278,19 @@ export async function transferObjects(client:PoolClient,userId:string,targetId:s
   for(const id of selected)if(!sourceRows.has(id))throw new ApiError(400,"Объект отсутствует в линии-источнике на выбранную дату");
   if(input.includeDependencies)for(const id of selected) {
     const row=sourceRows.get(id)!;
-    const linked=row.kind==="events"?row.data!.characterIds as string[]:row.kind==="relations"?[row.data!.fromId,row.data!.toId] as string[]:[];
+    const linked=row.kind==="events"?row.data!.characterIds as string[]:row.kind==="relations"?relationParticipants(row.data!):[];
     for(const dependency of linked){if(!sourceRows.has(dependency))throw new ApiError(400,"В источнике отсутствует связанный персонаж");selected.add(dependency);}
   }
   const targetRows=new Map((await resolve(client,scoped.timeline,day)).map((row)=>[row.object_id,row]));
   for(const id of selected) {
     const old=targetRows.get(id);
-    if(old&&!old.deleted&&canonical(old.data)!==canonical(sourceRows.get(id)!.data)&&!input.overwrite)throw new ApiError(409,"Объект уже отличается в целевой линии. Подтвердите перезапись или выберите другие объекты");
+    if(old&&!old.deleted&&canonical(semantic(old))!==canonical(semantic(sourceRows.get(id)!))&&!input.overwrite)throw new ApiError(409,"Объект уже отличается в целевой линии. Подтвердите перезапись или выберите другие объекты");
   }
   let transferred=0;
   const ordered=[...selected].sort((a,b)=>(sourceRows.get(a)!.kind==="characters"?0:1)-(sourceRows.get(b)!.kind==="characters"?0:1));
   for(const id of ordered) {
     const row=sourceRows.get(id)!,before=targetRows.get(id);
-    if(before&&!before.deleted&&canonical(before.data)===canonical(row.data))continue;
+    if(before&&!before.deleted&&canonical(semantic(before))===canonical(semantic(row)))continue;
     await ensureLinks(client,scoped,day,row.kind,row.data!);
     const saved=await append(client,scoped,userId,id,row.kind,day,parse(row.kind,row.data),before);
     targetRows.set(id,saved);transferred++;

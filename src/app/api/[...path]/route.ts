@@ -8,6 +8,11 @@ import { audit, createEntity, createProject, createWorld, loadWorld, mutateEntit
 import { createDemo } from "@/server/demo";
 import { compareTimelines, createCalendar, createTimeline, listCalendars, listTimelines, objectHistory, transferObjects, updateTimeline } from "@/server/history";
 import { calendarCreateSchema, daySchema, temporalOptions, timelineCreateSchema, timelinePatchSchema, transferSchema } from "@/server/history-validation";
+import { getFamily, createFamilyEdge, updateFamilyEdge, deleteFamilyEdge, importFamily } from "@/server/family";
+import { familyCreateSchema, familyPatchSchema, familyDeleteSchema, familyImportSchema } from "@/server/family-validation";
+import { getPortrait, setPortrait, deletePortrait, MAX_PORTRAIT_BYTES } from "@/server/portraits";
+import { listCharacterCatalog } from "@/server/catalog";
+import { getTimelineGraph, saveTimelineGraph, timelineGraphSchema } from "@/server/timeline-graph";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,6 +42,21 @@ async function body<T>(request: NextRequest, schema: ZodType<T>): Promise<T> {
   catch { throw new ApiError(400, "Некорректный JSON"); }
   return schema.parse(data);
 }
+async function imageBody(request: NextRequest): Promise<Buffer> {
+  if (Number(request.headers.get("content-length")) > MAX_PORTRAIT_BYTES) throw new ApiError(413, "Изображение должно быть не больше 5 МиБ");
+  const reader = request.body?.getReader();
+  if (!reader) throw new ApiError(400, "Выберите изображение персонажа");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_PORTRAIT_BYTES) { await reader.cancel(); throw new ApiError(413, "Изображение должно быть не больше 5 МиБ"); }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
 function csrf(request: NextRequest) {
   if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return;
   // Next may normalize nextUrl's hostname to its bind address. The HTTP Host is
@@ -52,8 +72,9 @@ async function dispatch(request: NextRequest, path: string[]) {
   const method = request.method;
   const key = path.join("/");
   if (key === "health" && method === "GET") {
-    const result = await pool.query("SELECT name FROM schema_migrations WHERE name=ANY($1::text[])", [["001_initial.sql", "002_history.sql"]]);
-    if (result.rowCount !== 2) throw new ApiError(503, "Необходимо применить миграции");
+    const required = ["001_initial.sql", "002_history.sql", "003_family_groups.sql", "004_portraits.sql", "005_timeline_graph.sql"];
+    const result = await pool.query("SELECT name FROM schema_migrations WHERE name=ANY($1::text[])", [required]);
+    if (result.rowCount !== required.length) throw new ApiError(503, "Необходимо применить миграции");
     const database = await pool.query<{test_database:boolean}>("SELECT current_database() ~ '_test$' AS test_database");
     return json({ status: "ok", database: "connected", testDatabase: database.rows[0].test_database });
   }
@@ -87,6 +108,63 @@ async function dispatch(request: NextRequest, path: string[]) {
   }
   const user = await requireUser(request);
   if (method !== "GET" && request.nextUrl.searchParams.has("revision")) throw new ApiError(400, "Нельзя изменять зафиксированную редакцию");
+  if (key === "characters/catalog" && method === "GET") {
+    const search = request.nextUrl.searchParams;
+    const rawLimit = search.get("limit");
+    if (rawLimit !== null && !/^[1-9]\d{0,2}$/.test(rawLimit)) throw new ApiError(400, "Некорректный размер страницы");
+    return json(await transaction((client) => listCharacterCatalog(client, user.id, {
+      query: search.get("q") ?? undefined, projectId: search.get("project") ?? undefined,
+      worldId: search.get("world") ?? undefined, timelineId: search.get("timeline") ?? undefined,
+      cursor: search.get("cursor") ?? undefined, limit: rawLimit === null ? undefined : Number(rawLimit),
+    })));
+  }
+  if (path[0] === "characters" && path.length === 3 && path[2] === "portrait") {
+    const id = uuid(path[1]);
+    if (method === "GET") {
+      const image = await transaction((client) => getPortrait(client, user.id, id));
+      if (!image) throw new ApiError(404, "Портрет персонажа не найден");
+      return new NextResponse(new Uint8Array(image.bytes), { headers: {
+        "Content-Type": image.contentType, "Content-Length": String(image.bytes.byteLength),
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox", "Content-Disposition": `inline; filename="${id}.webp"`,
+      } });
+    }
+    if (method === "PUT") {
+      const bytes = await imageBody(request);
+      return json(await transaction((client) => setPortrait(client, user.id, id, bytes, request.headers.get("content-type") ?? "")));
+    }
+    if (method === "DELETE") return json(await transaction((client) => deletePortrait(client, user.id, id)));
+  }
+  if (path[0] === "worlds" && path.length >= 3) {
+    const worldId = uuid(path[1]);
+    if (path.length === 3 && path[2] === "family" && method === "GET") return json(await transaction((client) => getFamily(client, user.id, worldId)));
+    if (path.length === 4 && path[2] === "family" && path[3] === "relations" && method === "POST") {
+      const input = await body(request, familyCreateSchema);
+      return json(await transaction((client) => createFamilyEdge(client, user.id, worldId, input)), 201);
+    }
+    if (path.length === 4 && path[2] === "family" && path[3] === "import" && method === "POST") {
+      const input = await body(request, familyImportSchema);
+      return json(await transaction((client) => importFamily(client, user.id, worldId, input)));
+    }
+    if (path.length === 3 && path[2] === "timeline-graph") {
+      if (method === "GET") return json(await transaction((client) => getTimelineGraph(client, user.id, worldId)));
+      if (method === "PUT") {
+        const input = await body(request, timelineGraphSchema);
+        return json(await transaction((client) => saveTimelineGraph(client, user.id, worldId, input)));
+      }
+    }
+  }
+  if (path[0] === "family" && path[1] === "relations" && path.length === 3) {
+    const id = uuid(path[2]);
+    if (method === "PATCH") {
+      const input = await body(request, familyPatchSchema);
+      return json(await transaction((client) => updateFamilyEdge(client, user.id, id, input)));
+    }
+    if (method === "DELETE") {
+      const input = await body(request, familyDeleteSchema);
+      return json(await transaction((client) => deleteFamilyEdge(client, user.id, id, input.expectedVersion)));
+    }
+  }
   if (path[0] === "timelines" && path.length >= 2) {
     const id = uuid(path[1]);
     if (path.length === 2 && method === "PATCH") {
@@ -227,4 +305,4 @@ async function handler(request: NextRequest, context: { params: Promise<{ path: 
     return json({ error: "Не удалось выполнить операцию. Повторите позже" }, 500);
   }
 }
-export { handler as GET, handler as POST, handler as PATCH, handler as DELETE };
+export { handler as GET, handler as POST, handler as PATCH, handler as DELETE, handler as PUT };
