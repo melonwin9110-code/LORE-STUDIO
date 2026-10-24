@@ -1,6 +1,6 @@
 {
   "name": "lore-studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "author": "ElpisHeart",
@@ -9,8 +9,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0",
-    "build": "next build",
+    "dev": "next dev --webpack --hostname 0.0.0.0",
+    "build": "next build --webpack",
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "next typegen && tsc --noEmit",
     "lint": "eslint .",
