@@ -47,7 +47,7 @@ export async function timelineContext(client: PoolClient, userId: string, timeli
 async function resolve(client: PoolClient, timeline: Timeline, day = LATEST_DAY, cutoff = timeline.headRevision): Promise<StateRow[]> {
   const found = await client.query<StateRow>(`${lineage}, candidates AS (
     SELECT r.*,o.kind,c.depth FROM lineage c JOIN lore_revisions r ON r.timeline_id=c.id AND r.world_id=c.world_id
-    JOIN lore_objects o ON o.id=r.object_id AND o.world_id=r.world_id
+    JOIN lore_objects o ON o.id=r.object_id AND o.world_id=r.world_id AND o.kind IN ('characters','events','relations')
     WHERE r.revision<=c.cutoff AND r.effective_day<=c.day
   ) SELECT DISTINCT ON(object_id) * FROM candidates ORDER BY object_id,depth,effective_day DESC,revision DESC`, [timeline.id, cutoff, day]);
   return found.rows;
@@ -124,7 +124,7 @@ async function ensureLinks(client: PoolClient, scoped: Context, day: string, kin
 }
 async function breakpoints(client: PoolClient, timeline: Timeline, first: string): Promise<string[]> {
   const found = await client.query<{effective_day:string;data:Fact|null;kind:Kind}>(`${lineage} SELECT r.effective_day,r.data,o.kind FROM lineage c
-    JOIN lore_revisions r ON r.timeline_id=c.id AND r.revision<=c.cutoff AND r.effective_day<=c.day JOIN lore_objects o ON o.id=r.object_id`,[timeline.id,timeline.headRevision,LATEST_DAY]);
+    JOIN lore_revisions r ON r.timeline_id=c.id AND r.revision<=c.cutoff AND r.effective_day<=c.day JOIN lore_objects o ON o.id=r.object_id AND o.kind IN ('characters','events','relations')`,[timeline.id,timeline.headRevision,LATEST_DAY]);
   const minimum = BigInt(first), points = new Set([first]);
   for (const row of found.rows) {
     if (BigInt(row.effective_day)>=minimum) points.add(row.effective_day);

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Character, LoreEvent, Project, Relation, User, World, WorldData } from "../../src/lib/types";
+import type { AtlasMap, MapData } from "../../src/lib/map-types";
 
 const base = process.env.TEST_BASE_URL ?? "http://127.0.0.1:3001";
 const origin = new URL(base).origin;
@@ -102,6 +103,15 @@ describe("PostgreSQL-backed application API", () => {
     expect(demo.body.characters.length).toBeGreaterThanOrEqual(2);
     expect(demo.body.events.length).toBeGreaterThan(0);
     expect(demo.body.relations.length).toBeGreaterThan(0);
+    const maps = await owner.request<{ maps: AtlasMap[] }>("GET", `/worlds/${worlds.body.worlds[0].id}/maps`);
+    expect(maps.body.maps).toHaveLength(1);
+    expect(maps.body.maps[0].name).toBe("Земли Элирии");
+    const atlas = await owner.request<MapData>("GET", `/maps/${maps.body.maps[0].id}`);
+    expect(atlas.response.status).toBe(200);
+    expect(atlas.body.features.some((feature) => feature.kind === "continent")).toBe(true);
+    expect(atlas.body.features.some((feature) => feature.kind === "state")).toBe(true);
+    expect(atlas.body.features.some((feature) => feature.eventId && demo.body.events.some((event) => event.id === feature.eventId))).toBe(true);
+    expect((await stranger.request("GET", `/maps/${atlas.body.map.id}`)).response.status).toBe(404);
     expect((await stranger.request("GET", `/worlds/${worlds.body.worlds[0].id}`)).response.status).toBe(404);
   });
 

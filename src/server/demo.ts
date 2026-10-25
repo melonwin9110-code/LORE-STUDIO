@@ -1,5 +1,6 @@
 import type { PoolClient } from "pg";
 import { createEntity, createProject, createWorld, projectAccess } from "./repository";
+import { createDemoAtlas } from "./map-demo";
 
 export async function createDemo(client: PoolClient, userId: string) {
   // Concurrent clicks must not create two copies. Each account gets its own private universe.
@@ -39,13 +40,14 @@ export async function createDemo(client: PoolClient, userId: string) {
     name: "Великое затмение", type: "Астрономическое явление", startYear: 1200,
     description: "Две луны одновременно скрыли солнце. Серебряный лес впервые за тысячу лет погрузился в тишину.", characterIds: [liora.id], status: "canon",
   });
-  await createEntity(client, userId, world.id, "events", {
+  const treaty = await createEntity(client, userId, world.id, "events", {
     name: "Договор у Серебряного древа", type: "Союз", startYear: 1246,
     description: "Хранители леса и северная стража договорились защищать пограничные земли вместе.", characterIds: [liora.id, aeren.id], status: "canon",
   });
-  await createEntity(client, userId, world.id, "events", {
+  const expedition = await createEntity(client, userId, world.id, "events", {
     name: "Экспедиция к Хребту Рассвета", type: "Путешествие", startYear: 1248,
     description: "Трое спутников отправляются по следам утраченной Книги рассвета. Чем завершится путешествие — решать вам.", characterIds: [liora.id, aeren.id, mira.id], status: "draft",
   });
+  await createDemoAtlas(client, userId, world.id, treaty.id, expedition.id);
   return project;
 }

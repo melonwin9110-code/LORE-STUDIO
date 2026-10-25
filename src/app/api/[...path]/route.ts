@@ -13,6 +13,8 @@ import { familyCreateSchema, familyPatchSchema, familyDeleteSchema, familyImport
 import { getPortrait, setPortrait, deletePortrait, MAX_PORTRAIT_BYTES } from "@/server/portraits";
 import { listCharacterCatalog } from "@/server/catalog";
 import { getTimelineGraph, saveTimelineGraph, timelineGraphSchema } from "@/server/timeline-graph";
+import { listMaps, createMap, getMap, updateMap, deleteMap, saveMapContent, mergeMapGeometry, splitMapGeometry, mapFeatureHistory } from "@/server/maps";
+import { mapCreateSchema, mapPatchSchema, mapDeleteSchema, mapBatchSchema, mapMergeSchema, mapSplitSchema } from "@/server/map-validation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,9 +25,9 @@ function json(value: unknown, status = 200, cookie?: string) {
   if (cookie) response.headers.set("Set-Cookie", cookie);
   return response;
 }
-async function body<T>(request: NextRequest, schema: ZodType<T>): Promise<T> {
+async function body<T>(request: NextRequest, schema: ZodType<T>, limit = maxBody): Promise<T> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) throw new ApiError(415, "Ожидается JSON");
-  if (Number(request.headers.get("content-length")) > maxBody) throw new ApiError(413, "Слишком большой запрос");
+  if (Number(request.headers.get("content-length")) > limit) throw new ApiError(413, "Слишком большой запрос");
   const reader = request.body?.getReader();
   if (!reader) throw new ApiError(400, "Пустой запрос");
   const chunks: Uint8Array[] = [];
@@ -34,7 +36,7 @@ async function body<T>(request: NextRequest, schema: ZodType<T>): Promise<T> {
     const { value, done } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > maxBody) { await reader.cancel(); throw new ApiError(413, "Слишком большой запрос"); }
+    if (size > limit) { await reader.cancel(); throw new ApiError(413, "Слишком большой запрос"); }
     chunks.push(value);
   }
   let data: unknown;
@@ -72,7 +74,7 @@ async function dispatch(request: NextRequest, path: string[]) {
   const method = request.method;
   const key = path.join("/");
   if (key === "health" && method === "GET") {
-    const required = ["001_initial.sql", "002_history.sql", "003_family_groups.sql", "004_portraits.sql", "005_timeline_graph.sql"];
+    const required = ["001_initial.sql", "002_history.sql", "003_family_groups.sql", "004_portraits.sql", "005_timeline_graph.sql", "006_maps.sql"];
     const result = await pool.query("SELECT name FROM schema_migrations WHERE name=ANY($1::text[])", [required]);
     if (result.rowCount !== required.length) throw new ApiError(503, "Необходимо применить миграции");
     const database = await pool.query<{test_database:boolean}>("SELECT current_database() ~ '_test$' AS test_database");
@@ -108,6 +110,48 @@ async function dispatch(request: NextRequest, path: string[]) {
   }
   const user = await requireUser(request);
   if (method !== "GET" && request.nextUrl.searchParams.has("revision")) throw new ApiError(400, "Нельзя изменять зафиксированную редакцию");
+  if (path[0] === "worlds" && path.length === 3 && path[2] === "maps") {
+    const worldId = uuid(path[1]);
+    const options = temporalOptions(request.nextUrl.searchParams, method !== "GET");
+    if (method === "GET") return json(await transaction((client) => listMaps(client, user.id, worldId, options)));
+    if (method === "POST") {
+      const input = await body(request, mapCreateSchema);
+      return json(await transaction((client) => createMap(client, user.id, worldId, input, options)), 201);
+    }
+  }
+  if (path[0] === "maps" && path.length >= 2) {
+    const id = uuid(path[1]);
+    const options = temporalOptions(request.nextUrl.searchParams, method !== "GET");
+    if (path.length === 2) {
+      if (method === "GET") return json(await transaction((client) => getMap(client, user.id, id, options)));
+      if (method === "PATCH") {
+        const input = await body(request, mapPatchSchema);
+        return json(await transaction((client) => updateMap(client, user.id, id, input, options)));
+      }
+      if (method === "DELETE") {
+        const input = await body(request, mapDeleteSchema);
+        return json(await transaction((client) => deleteMap(client, user.id, id, input.version, options)));
+      }
+    }
+    if (path.length === 3 && path[2] === "content" && method === "PUT") {
+      const input = await body(request, mapBatchSchema, 4 * 1024 * 1024);
+      return json(await transaction((client) => saveMapContent(client, user.id, id, input, options)));
+    }
+    if (path.length === 4 && path[2] === "geometry" && method === "POST") {
+      if (path[3] === "merge") {
+        const input = await body(request, mapMergeSchema, 4 * 1024 * 1024);
+        return json(await transaction((client) => mergeMapGeometry(client, user.id, id, input, options)));
+      }
+      if (path[3] === "split") {
+        const input = await body(request, mapSplitSchema, 4 * 1024 * 1024);
+        return json(await transaction((client) => splitMapGeometry(client, user.id, id, input, options)));
+      }
+    }
+  }
+  if (path[0] === "map-features" && path.length === 3 && path[2] === "history" && method === "GET") {
+    const id = uuid(path[1]);
+    return json(await transaction((client) => mapFeatureHistory(client, user.id, id, temporalOptions(request.nextUrl.searchParams))));
+  }
   if (key === "characters/catalog" && method === "GET") {
     const search = request.nextUrl.searchParams;
     const rawLimit = search.get("limit");
