@@ -15,6 +15,7 @@ import { listCharacterCatalog } from "@/server/catalog";
 import { getTimelineGraph, saveTimelineGraph, timelineGraphSchema } from "@/server/timeline-graph";
 import { listMaps, createMap, getMap, updateMap, deleteMap, saveMapContent, mergeMapGeometry, splitMapGeometry, mapFeatureHistory } from "@/server/maps";
 import { mapCreateSchema, mapPatchSchema, mapDeleteSchema, mapBatchSchema, mapMergeSchema, mapSplitSchema } from "@/server/map-validation";
+import { createGeneratedMap, mapGenerateSchema } from "@/server/map-generation";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -110,6 +111,11 @@ async function dispatch(request: NextRequest, path: string[]) {
   }
   const user = await requireUser(request);
   if (method !== "GET" && request.nextUrl.searchParams.has("revision")) throw new ApiError(400, "Нельзя изменять зафиксированную редакцию");
+  if (path[0] === "worlds" && path.length === 4 && path[2] === "maps" && path[3] === "generate" && method === "POST") {
+    const worldId = uuid(path[1]);
+    const input = await body(request, mapGenerateSchema);
+    return json(await transaction((client) => createGeneratedMap(client, user.id, worldId, input, temporalOptions(request.nextUrl.searchParams, true))), 201);
+  }
   if (path[0] === "worlds" && path.length === 3 && path[2] === "maps") {
     const worldId = uuid(path[1]);
     const options = temporalOptions(request.nextUrl.searchParams, method !== "GET");

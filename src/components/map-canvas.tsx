@@ -10,6 +10,7 @@ import GeoJSON from "ol/format/GeoJSON";
 import Geometry from "ol/geom/Geometry";
 import Polygon from "ol/geom/Polygon";
 import LineString from "ol/geom/LineString";
+import MultiPoint from "ol/geom/MultiPoint";
 import Projection from "ol/proj/Projection";
 import VectorLayer from "ol/layer/Vector";
 import VectorSource from "ol/source/Vector";
@@ -48,6 +49,7 @@ type CanvasRuntime = {
   baseSource: VectorSource<Feature<Geometry>>;
   baseLayer: VectorMapLayer;
   layers: Map<string, VectorMapLayer>;
+  selectionLayers: Map<string, VectorMapLayer>;
   features: Map<string, Feature<Geometry>>;
   select: Select;
 };
@@ -79,32 +81,60 @@ function inside(geometry: Geometry, map: AtlasMap) {
   return extent.every(Number.isFinite) && extent[0] >= 0 && extent[1] >= 0 && extent[2] <= map.width && extent[3] <= map.height;
 }
 
-function geographyStyle(record: MapFeature, selected: boolean): Style {
+function lightPaint(color: string) {
+  const rgb = [1, 3, 5].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16) / 255);
+  return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722 > 0.56;
+}
+
+function geographyStyle(record: MapFeature): Style {
   const point = record.geometry.type === "Point";
   const textOnly = record.kind === "label";
   const stroke = new Stroke({
-    color: selected ? "#e1bfff" : record.stroke,
-    width: record.strokeWidth + (selected ? 2 : 0),
+    color: record.stroke,
+    width: record.strokeWidth,
     lineDash: record.kind === "border" ? [9, 5] : record.kind === "road" ? [6, 3] : undefined,
     lineCap: "round", lineJoin: "round",
   });
   const fill = new Fill({ color: record.fill });
   const symbol = record.kind === "fortress"
-    ? new RegularShape({ points: 4, radius: selected ? 9 : 7, angle: Math.PI / 4, fill, stroke })
+    ? new RegularShape({ points: 4, radius: 7, angle: Math.PI / 4, fill, stroke })
     : record.kind === "port"
-      ? new RegularShape({ points: 3, radius: selected ? 9 : 7, rotation: Math.PI, fill, stroke })
-      : new CircleStyle({ radius: textOnly ? 0 : selected ? 8 : record.kind === "city" ? 6 : 5, fill, stroke });
+      ? new RegularShape({ points: 3, radius: 7, rotation: Math.PI, fill, stroke })
+      : new CircleStyle({ radius: textOnly ? 0 : record.kind === "city" ? 6 : 5, fill, stroke });
+  const water = ["ocean", "sea", "lake", "river"].includes(record.kind);
+  const light = lightPaint(record.fill);
+  const labelFont = record.kind === "state" ? "600 14px" : record.kind === "continent" ? "500 15px" : water ? "italic 12px" : "500 12px";
   return new Style({
     fill, stroke, image: point ? symbol : undefined,
     text: record.label || textOnly ? new Text({
-      text: record.name, font: `${record.kind === "state" ? "600 14px" : "500 12px"} Georgia, serif`,
-      fill: new Fill({ color: selected ? "#f2ddff" : "#f4ead3" }),
-      stroke: new Stroke({ color: "#11202cee", width: 3 }),
+      text: record.name, font: `${labelFont} Georgia, serif`,
+      fill: new Fill({ color: light ? "#263b34" : "#f4ead3" }),
+      stroke: new Stroke({ color: light ? "#faf6e7b3" : "#132936b3", width: 2.5 }),
       offsetY: point && !textOnly ? -17 : 0, overflow: false,
       padding: [3, 4, 3, 4],
     }) : undefined,
-    zIndex: selected ? 10000 : record.kind === "label" ? 9000 : point ? 1000 : geographyOrder[record.kind],
+    zIndex: record.kind === "label" ? 9000 : point ? 1000 : geographyOrder[record.kind],
   });
+}
+
+// Selection is editor chrome, not a replacement for the author's paint. Its
+// frame sits outside the object so fill and contour remain visible while editing.
+function selectionStyle(feature: FeatureLike, resolution: number): Style[] {
+  const geometry = (feature as Feature<Geometry>).getGeometry();
+  if (!geometry) return [];
+  const stroke = new Stroke({ color: "#f7e5bde8", width: 1.2, lineDash: [4, 4] });
+  if (geometry.getType() === "Point") return [new Style({
+    image: new CircleStyle({ radius: 12, stroke }),
+  })];
+  const [left, bottom, right, top] = geometry.getExtent(), padding = resolution * 6;
+  const corners = [[left - padding, bottom - padding], [right + padding, bottom - padding], [right + padding, top + padding], [left - padding, top + padding]];
+  return [
+    new Style({ geometry: new Polygon([[...corners, corners[0]]]), stroke }),
+    new Style({ geometry: new MultiPoint(corners), image: new RegularShape({
+      points: 4, radius: 3.5, angle: Math.PI / 4,
+      fill: new Fill({ color: "#f7edd9" }), stroke: new Stroke({ color: "#263640", width: 1 }),
+    }) }),
+  ];
 }
 
 function drawBase(runtime: CanvasRuntime, map: AtlasMap) {
@@ -150,7 +180,7 @@ export function MapCanvas(props: MapCanvasProps) {
       view: new View({ projection, center: [current.map.width / 2, current.map.height / 2], resolution: 1, minResolution: 0.01, maxResolution: Math.max(current.map.width, current.map.height), extent: [0, 0, current.map.width, current.map.height], constrainOnlyCenter: true, showFullExtent: true, smoothExtentConstraint: false }),
     });
     map.addInteraction(select);
-    const state: CanvasRuntime = { map, projection, baseSource, baseLayer, select, layers: new Map(), features: new Map() };
+    const state: CanvasRuntime = { map, projection, baseSource, baseLayer, select, layers: new Map(), selectionLayers: new Map(), features: new Map() };
     runtime.current = state;
     drawBase(state, current.map);
     select.on("select", () => {
@@ -180,21 +210,31 @@ export function MapCanvas(props: MapCanvasProps) {
     if (!state) return;
     drawBase(state, props.map);
     const wantedLayers = new Set(props.layers.map((layer) => layer.id));
-    for (const [id, layer] of state.layers) if (!wantedLayers.has(id)) { state.map.removeLayer(layer); state.layers.delete(id); }
-    const selected = new Set(props.selectedIds);
+    for (const [id, layer] of state.layers) if (!wantedLayers.has(id)) {
+      layer.getSource()?.clear();
+      state.map.removeLayer(layer); state.layers.delete(id);
+      const overlay = state.selectionLayers.get(id);
+      if (overlay) { overlay.getSource()?.clear(); state.map.removeLayer(overlay); }
+      state.selectionLayers.delete(id);
+    }
     const styleCache = new Map<string, Style>();
     for (const layer of props.layers) {
       let rendered = state.layers.get(layer.id);
       if (!rendered) {
         rendered = new VectorLayer({ source: new VectorSource<Feature<Geometry>>(), declutter: true });
         rendered.set("loreLayer", layer.id); state.layers.set(layer.id, rendered); state.map.addLayer(rendered);
+        const overlay = new VectorLayer({ source: new VectorSource<Feature<Geometry>>(), style: selectionStyle, updateWhileAnimating: true, updateWhileInteracting: true });
+        state.selectionLayers.set(layer.id, overlay); state.map.addLayer(overlay);
       }
       rendered.setZIndex(100 + layer.order); rendered.setOpacity(layer.opacity); rendered.setVisible(layerVisible(layer, props.view));
+      const overlay = state.selectionLayers.get(layer.id);
+      // Keep the selection indicator within its own layer's stacking position.
+      overlay?.setZIndex(100 + layer.order + 0.5); overlay?.setOpacity(layer.opacity); overlay?.setVisible(layerVisible(layer, props.view));
       rendered.setStyle((feature: FeatureLike) => {
         const record = feature.get("loreRecord") as MapFeature | undefined;
         if (!record) return undefined;
         let style = styleCache.get(record.id);
-        if (!style) { style = geographyStyle(record, selected.has(record.id)); styleCache.set(record.id, style); }
+        if (!style) { style = geographyStyle(record); styleCache.set(record.id, style); }
         return style;
       });
     }
@@ -221,10 +261,13 @@ export function MapCanvas(props: MapCanvasProps) {
       if (!source.hasFeature(feature)) source.addFeature(feature);
     }
     const collection = state.select.getFeatures(); collection.clear();
+    for (const overlay of state.selectionLayers.values()) overlay.getSource()?.clear();
     for (const id of props.selectedIds) {
       const feature = state.features.get(id), record = props.features.find((item) => item.id === id);
       const layer = record && props.layers.find((item) => item.id === record.layerId);
-      if (feature && layer && layerVisible(layer, props.view)) collection.push(feature);
+      if (feature && layer && layerVisible(layer, props.view)) {
+        collection.push(feature); state.selectionLayers.get(layer.id)?.getSource()?.addFeature(feature);
+      }
     }
     for (const layer of state.layers.values()) layer.changed();
   }, [props.map, props.features, props.layers, props.view, props.selectedIds]);

@@ -47,6 +47,11 @@ export const mapCreateSchema = z.object({
   width: z.number().int().min(100).max(100_000).default(1000),
   height: z.number().int().min(100).max(100_000).default(700),
   background: color.default("#132530"),
+  generation: z.object({
+    seed: z.string().trim().min(1).max(128),
+    preset: z.enum(["island", "continents", "archipelago"]),
+    algorithmVersion: z.string().min(1).max(80),
+  }).strict().optional(),
 }).strict();
 
 export const mapPatchSchema = z.object({

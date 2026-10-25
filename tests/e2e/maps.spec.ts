@@ -40,10 +40,27 @@ async function screenPoint(target: Locator, point: MapPoint, width = 1000, heigh
   const resolution = Math.max(width / (box!.width - 64), height / (box!.height - 84));
   return { x: box!.x + box!.width / 2 + (point[0] - width / 2) / resolution, y: box!.y + box!.height / 2 - (point[1] - height / 2) / resolution };
 }
+async function fitCanvas(page: Page) {
+  const target = await canvas(page);
+  await page.getByRole("button", { name: "Уместить карту", exact: true }).click();
+  const box = (await target.boundingBox())!;
+  const resolution = Math.max(1000 / (box.width - 64), 700 / (box.height - 84));
+  let attempt = 0;
+  // The inspector resizes the viewport while OpenLayers correctly keeps the
+  // author's zoom. Explicitly fit before gestures at known world coordinates,
+  // and wait for the visible coordinate readout instead of a fixed delay.
+  await expect.poll(async () => {
+    const offset = 80 + (attempt++ % 2) * 0.1;
+    await page.mouse.move(box.x + box.width / 2 + offset, box.y + box.height / 2);
+    const values = (await target.locator("..").locator('[class*="coordinates"] > span').innerText()).match(/\d+/g)?.map(Number);
+    return Boolean(values && Math.abs(values[0] - (500 + offset * resolution)) <= 1 && Math.abs(values[1] - 350) <= 1);
+  }).toBe(true);
+  return target;
+}
 async function draw(page: Page, kind: string, points: MapPoint[]) {
   await page.getByRole("combobox", { name: "Тип объекта карты", exact: true }).selectOption(kind);
   await page.getByRole("button", { name: "Нарисовать объект", exact: true }).click();
-  const target = await canvas(page);
+  const target = await fitCanvas(page);
   for (let index = 0; index < points.length; index++) {
     const pixel = await screenPoint(target, points[index]);
     if (index === points.length - 1 && points.length > 1) await page.mouse.dblclick(pixel.x, pixel.y);
@@ -52,9 +69,17 @@ async function draw(page: Page, kind: string, points: MapPoint[]) {
 }
 async function renameSelected(page: Page, name: string, description?: string) {
   await page.getByRole("textbox", { name: "Название объекта", exact: true }).fill(name);
-  if (description !== undefined) await page.getByRole("textbox", { name: "Описание объекта карты", exact: true }).fill(description);
+  if (description !== undefined) { await showDescription(page); await page.getByRole("textbox", { name: "Описание объекта карты", exact: true }).fill(description); }
   await page.getByRole("button", { name: "Применить свойства", exact: true }).click();
   await expect(page.getByRole("button", { name: `Выбрать объект ${name}`, exact: true })).toBeVisible();
+}
+async function showDescription(page: Page) {
+  const summary = page.getByText("Описание и связи", { exact: true });
+  if (await summary.count() && !(await summary.evaluate((element) => element.closest("details")?.open))) await summary.click();
+}
+async function showExtraTools(page: Page) {
+  const summary = page.getByText("Ещё", { exact: true });
+  if (await summary.count() && !(await summary.evaluate((element) => element.closest("details")?.open))) await summary.click();
 }
 async function save(page: Page) {
   const button = page.getByRole("button", { name: "Сохранить карту", exact: true });
@@ -83,6 +108,7 @@ async function seedMap(page: Page, worldId: string, timeline: string, definition
 }
 async function changeLine(page: Page, id: string) {
   const select = page.getByRole("combobox", { name: "Временная линия", exact: true });
+  if (!await select.isVisible()) await page.getByText("Линия и время карты", { exact: true }).click();
   await select.selectOption(id); await expect(select).toHaveValue(id);
   await canvas(page);
 }
@@ -126,6 +152,7 @@ test("автор рисует настоящие территории, горо�
     expect(stored.features.find((value) => value.name === "Серебряная река")?.geometry.type).toBe("LineString");
     await page.reload(); await openAtlas(page); await canvas(page);
     await page.getByRole("button", { name: "Выбрать объект Материк Рассвета", exact: true }).click();
+    await showDescription(page);
     await expect(page.getByRole("textbox", { name: "Описание объекта карты", exact: true })).toHaveValue("Контур нарисован мышью и должен сохраниться");
     await page.getByRole("button", { name: "История объекта", exact: true }).click();
     const history = page.getByRole("dialog", { name: "История объекта карты", exact: true });
@@ -160,7 +187,7 @@ test("физическая и политическая карты использ
     await changeLine(page, branch.id);
     await page.getByRole("button", { name: "Выбрать объект Границы империи", exact: true }).click();
     await page.getByRole("button", { name: "Переместить объекты", exact: true }).click();
-    let target = await canvas(page), start = await screenPoint(target, [300, 250]), end = await screenPoint(target, [430, 300]);
+    let target = await fitCanvas(page), start = await screenPoint(target, [300, 250]), end = await screenPoint(target, [430, 300]);
     await page.mouse.move(start.x, start.y); await page.mouse.down(); await page.mouse.move(end.x, end.y, { steps: 16 }); await page.mouse.up();
     await save(page);
     const moved = await getMap(page, seeded.map.id, branch.id), territory = moved.features.find((value) => value.kind === "state")!;
@@ -170,7 +197,7 @@ test("физическая и политическая карты использ
     const vertex = (territory.geometry as Extract<MapGeometry, { type: "Polygon" }>).coordinates[0][0];
     await page.getByRole("button", { name: "Выбрать объект Границы империи", exact: true }).click();
     await page.getByRole("button", { name: "Редактировать узлы", exact: true }).click();
-    target = await canvas(page); start = await screenPoint(target, vertex); end = await screenPoint(target, [vertex[0] + 25, vertex[1] + 30]);
+    target = await fitCanvas(page); start = await screenPoint(target, vertex); end = await screenPoint(target, [vertex[0] + 25, vertex[1] + 30]);
     await page.mouse.move(start.x, start.y); await page.mouse.down(); await page.mouse.move(end.x, end.y, { steps: 12 }); await page.mouse.up();
     await expect(page.getByRole("button", { name: "Сохранить карту", exact: true })).toBeEnabled();
     await page.getByRole("button", { name: "Отменить действие", exact: true }).click();
@@ -200,6 +227,7 @@ test("объединение и разделение территорий отм
     await page.goto("/"); await openAtlas(page); await canvas(page);
     await page.getByRole("button", { name: "Политическая карта", exact: true }).click();
     for (const name of ["Западная территория", "Восточная территория"]) await page.getByRole("checkbox", { name: `Выделить объект ${name}`, exact: true }).check();
+    await showExtraTools(page);
     await page.getByRole("button", { name: "Объединить территории", exact: true }).click();
     await expect(page.getByRole("button", { name: /^Выбрать объект (Западная|Восточная) территория$/ })).toHaveCount(1);
     await page.getByRole("button", { name: "Отменить действие", exact: true }).click();
@@ -208,8 +236,9 @@ test("объединение и разделение территорий отм
     await save(page);
     const united = await getMap(page, seeded.map.id); expect(united.features).toHaveLength(1);
     await page.getByRole("button", { name: `Выбрать объект ${united.features[0].name}`, exact: true }).click();
+    await showExtraTools(page);
     await page.getByRole("button", { name: "Разделить территорию", exact: true }).click();
-    const target = await canvas(page), start = await screenPoint(target, [350, 120]), end = await screenPoint(target, [350, 550]);
+    const target = await fitCanvas(page), start = await screenPoint(target, [350, 120]), end = await screenPoint(target, [350, 550]);
     await page.mouse.click(start.x, start.y); await page.mouse.dblclick(end.x, end.y);
     await expect(page.getByRole("button", { name: new RegExp(`^Выбрать объект ${united.features[0].name} · часть 2$`) })).toBeVisible();
     await page.getByRole("button", { name: "Отменить действие", exact: true }).click();

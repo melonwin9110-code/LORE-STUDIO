@@ -14,7 +14,9 @@ export const GEOGRAPHY_TYPES = {
   label: "Подпись", custom: "Пользовательский объект",
 } as const;
 export type GeographyKind = keyof typeof GEOGRAPHY_TYPES;
-export type MapInput = { name: string; description: string; width: number; height: number; background: string };
+export type MapGenerationPreset = "island" | "continents" | "archipelago";
+export type MapGenerationInfo = { seed: string; preset: MapGenerationPreset; algorithmVersion: string };
+export type MapInput = { name: string; description: string; width: number; height: number; background: string; generation?: MapGenerationInfo };
 export type AtlasMap = MapInput & { id: string; worldId: string; version: number };
 export type MapLayerInput = { name: string; kind: "physical" | "political" | "custom"; visible: boolean; locked: boolean; opacity: number; order: number };
 export type MapLayer = MapLayerInput & { id: string; worldId: string; mapId: string; version: number };
