@@ -16,6 +16,9 @@ import { getTimelineGraph, saveTimelineGraph, timelineGraphSchema } from "@/serv
 import { listMaps, createMap, getMap, updateMap, deleteMap, saveMapContent, mergeMapGeometry, splitMapGeometry, mapFeatureHistory } from "@/server/maps";
 import { mapCreateSchema, mapPatchSchema, mapDeleteSchema, mapBatchSchema, mapMergeSchema, mapSplitSchema } from "@/server/map-validation";
 import { createGeneratedMap, mapGenerateSchema } from "@/server/map-generation";
+import { listWiki, getWikiPage, createWikiArticle, updateWikiArticle, deleteWikiArticle, wikiArticleHistory } from "@/server/wiki";
+import { wikiCreateSchema, wikiPatchSchema, wikiDeleteSchema, wikiFiltersSchema } from "@/server/wiki-validation";
+import { createWikiImage, getWikiImage, MAX_WIKI_IMAGE_BYTES } from "@/server/wiki-images";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,8 +48,8 @@ async function body<T>(request: NextRequest, schema: ZodType<T>, limit = maxBody
   catch { throw new ApiError(400, "Некорректный JSON"); }
   return schema.parse(data);
 }
-async function imageBody(request: NextRequest): Promise<Buffer> {
-  if (Number(request.headers.get("content-length")) > MAX_PORTRAIT_BYTES) throw new ApiError(413, "Изображение должно быть не больше 5 МиБ");
+async function imageBody(request: NextRequest, limit = MAX_PORTRAIT_BYTES): Promise<Buffer> {
+  if (Number(request.headers.get("content-length")) > limit) throw new ApiError(413, "Изображение должно быть не больше 5 МиБ");
   const reader = request.body?.getReader();
   if (!reader) throw new ApiError(400, "Выберите изображение персонажа");
   const chunks: Uint8Array[] = [];
@@ -55,7 +58,7 @@ async function imageBody(request: NextRequest): Promise<Buffer> {
     const { value, done } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > MAX_PORTRAIT_BYTES) { await reader.cancel(); throw new ApiError(413, "Изображение должно быть не больше 5 МиБ"); }
+    if (size > limit) { await reader.cancel(); throw new ApiError(413, "Изображение должно быть не больше 5 МиБ"); }
     chunks.push(value);
   }
   return Buffer.concat(chunks);
@@ -75,7 +78,7 @@ async function dispatch(request: NextRequest, path: string[]) {
   const method = request.method;
   const key = path.join("/");
   if (key === "health" && method === "GET") {
-    const required = ["001_initial.sql", "002_history.sql", "003_family_groups.sql", "004_portraits.sql", "005_timeline_graph.sql", "006_maps.sql"];
+    const required = ["001_initial.sql", "002_history.sql", "003_family_groups.sql", "004_portraits.sql", "005_timeline_graph.sql", "006_maps.sql", "007_wiki.sql"];
     const result = await pool.query("SELECT name FROM schema_migrations WHERE name=ANY($1::text[])", [required]);
     if (result.rowCount !== required.length) throw new ApiError(503, "Необходимо применить миграции");
     const database = await pool.query<{test_database:boolean}>("SELECT current_database() ~ '_test$' AS test_database");
@@ -111,6 +114,52 @@ async function dispatch(request: NextRequest, path: string[]) {
   }
   const user = await requireUser(request);
   if (method !== "GET" && request.nextUrl.searchParams.has("revision")) throw new ApiError(400, "Нельзя изменять зафиксированную редакцию");
+  if (path[0] === "worlds" && path[2] === "wiki" && path.length >= 3 && path.length <= 4) {
+    const worldId = uuid(path[1]);
+    if (path.length === 4 && path[3] === "images" && method === "POST") {
+      const bytes = await imageBody(request, MAX_WIKI_IMAGE_BYTES);
+      return json(await transaction((client) => createWikiImage(client, user.id, worldId, bytes, request.headers.get("content-type") ?? "")), 201);
+    }
+    const options = temporalOptions(request.nextUrl.searchParams, method !== "GET");
+    if (path.length === 3) {
+      if (method === "GET") {
+        const search = request.nextUrl.searchParams;
+        const filters = wikiFiltersSchema.parse({ query: search.get("q") ?? undefined, category: search.get("category") ?? undefined, tag: search.get("tag") ?? undefined, kind: search.get("kind") ?? undefined, knowledge: search.get("knowledge") ?? undefined });
+        return json(await transaction((client) => listWiki(client, user.id, worldId, filters, options)));
+      }
+      if (method === "POST") {
+        const input = await body(request, wikiCreateSchema, 1024 * 1024);
+        return json(await transaction((client) => createWikiArticle(client, user.id, worldId, input, options)), 201);
+      }
+    }
+    if (path.length === 4 && method === "GET") {
+      const entryId = uuid(path[3]);
+      return json(await transaction((client) => getWikiPage(client, user.id, worldId, entryId, options)));
+    }
+  }
+  if (path[0] === "wiki-articles" && path.length >= 2 && path.length <= 3) {
+    const articleId = uuid(path[1]);
+    const options = temporalOptions(request.nextUrl.searchParams, method !== "GET");
+    if (path.length === 3 && path[2] === "history" && method === "GET") return json(await transaction((client) => wikiArticleHistory(client, user.id, articleId, options)));
+    if (path.length === 2 && method === "PATCH") {
+      const input = await body(request, wikiPatchSchema, 1024 * 1024);
+      return json(await transaction((client) => updateWikiArticle(client, user.id, articleId, input, options)));
+    }
+    if (path.length === 2 && method === "DELETE") {
+      const input = await body(request, wikiDeleteSchema);
+      return json(await transaction((client) => deleteWikiArticle(client, user.id, articleId, input.version, options)));
+    }
+  }
+  if (path[0] === "wiki-images" && path.length === 2 && method === "GET") {
+    const imageId = uuid(path[1]);
+    const asset = await transaction((client) => getWikiImage(client, user.id, imageId));
+    if (!asset) throw new ApiError(404, "Изображение не найдено");
+    return new NextResponse(new Uint8Array(asset.bytes), { headers: {
+      "Content-Type": asset.contentType, "Content-Length": String(asset.bytes.byteLength),
+      "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox", "Content-Disposition": `inline; filename="${imageId}.webp"`,
+    } });
+  }
   if (path[0] === "worlds" && path.length === 4 && path[2] === "maps" && path[3] === "generate" && method === "POST") {
     const worldId = uuid(path[1]);
     const input = await body(request, mapGenerateSchema);
